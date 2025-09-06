@@ -1,152 +1,59 @@
-# app_ee_streamlit.py
 import streamlit as st
+import ee
+import geemap.foliumap as geemap
 import pandas as pd
-import folium
-from streamlit_folium import st_folium
+import datetime
 
-st.set_page_config(page_title="NO2 Sentinel-5P — Hortolândia", layout="wide")
-st.title("🌍 NO₂ (Sentinel-5P) — Hortolândia (GEE → Folium)")
-
-# ========== Dependências Earth Engine (opcionais) ==========
-ee_available = False
-ee_error = None
+# ---------------------------
+# Inicializar Earth Engine
+# ---------------------------
 try:
-    import ee
-    try:
-        ee.Initialize()  # tente inicializar (usuário local precisa ter autenticado previamente)
-        ee_available = True
-    except Exception as e:
-        ee_error = str(e)
-        ee_available = False
+    ee.Initialize()
 except Exception as e:
-    ee_error = str(e)
-    ee_available = False
+    ee.Authenticate()
+    ee.Initialize()
 
-# ========== Parâmetros UI ==========
+# ---------------------------
+# Configurações da página
+# ---------------------------
+st.set_page_config(layout="wide")
+st.title("🌍 Monitoramento da Qualidade do Ar - Hortolândia")
+
+# ---------------------------
+# Seleção de parâmetros
+# ---------------------------
 st.sidebar.header("Parâmetros")
-start_date = st.sidebar.date_input("Data início", value=pd.to_datetime("2025-09-01"))
-end_date = st.sidebar.date_input("Data fim", value=pd.to_datetime("2025-09-05"))
-pol = st.sidebar.selectbox("Poluente (satélite)", ["NO2"], index=0)
-use_sample = st.sidebar.checkbox("Usar CSV local de exemplo (fallback)", value=True)
-uploaded = st.sidebar.file_uploader("Ou carregue seu CSV (latitude,longitude,data,pm25,no2,o3)", type="csv")
 
-# Região aproximada de Hortolândia (retângulo)
-min_lon, min_lat = -47.261, -22.877
-max_lon, max_lat = -47.149, -22.781
+start_date = st.sidebar.date_input("Data início", value=datetime.date(2025, 9, 1))
+end_date = st.sidebar.date_input("Data fim", value=datetime.date(2025, 9, 5))
 
-# ========== Helper: adicionar camada EE ao folium ==========
-def add_ee_layer(folium_map, ee_object, vis_params, name):
-    """Adiciona um layer do Earth Engine ao folium (usa getMapId)."""
-    try:
-        mapid_dict = ee_object.getMapId(vis_params)
-        tile_url = mapid_dict['tile_fetcher'].url_format
-        folium.TileLayer(
-            tiles=tile_url,
-            attr='Google Earth Engine',
-            name=name,
-            overlay=True,
-            control=True
-        ).add_to(folium_map)
-    except Exception as e:
-        st.error(f"Erro ao adicionar camada EE no mapa: {e}")
+sd = pd.to_datetime(start_date).strftime("%Y-%m-%d")
+ed = pd.to_datetime(end_date).strftime("%Y-%m-%d")
 
-# ========== Construir o mapa ==========
-center = [ (min_lat+max_lat)/2, (min_lon+max_lon)/2 ]
-m = folium.Map(location=center, zoom_start=12, control_scale=True)
+pollutant = st.sidebar.selectbox(
+    "Selecione o poluente",
+    ["NO2", "O3", "CO"]
+)
 
-# 1) Se Earth Engine disponível → buscar Sentinel-5P NO2 (L3 NRTI) e adicionar média do período
-if ee_available:
-    st.sidebar.success("Earth Engine inicializado")
-    # converter datas para strings
-    sd = pd.to_datetime(start_date).strftime("%Y-%m-%d")
-    ed = pd.to_datetime(end_date).strftime("%Y-%m-%d")
-    roi = ee.Geometry.Rectangle([min_lon, min_lat, max_lon, max_lat])
+# ---------------------------
+# Coordenadas de Hortolândia
+# ---------------------------
+roi = ee.Geometry.Point([-47.2191, -22.8583]).buffer(20000)  # 20 km
 
-    # Dataset: COPERNICUS/S5P/NRTI/L3_NO2 — usar banda tropospheric (mais relevante para NO2 troposférico)
-    collection = ee.ImageCollection("COPERNICUS/S5P/NRTI/L3_NO2") \
-                    .select("tropospheric_NO2_column_number_density") \
-                    .filterDate(sd, ed) \
-                    .filterBounds(roi)
+# ---------------------------
+# Seleção de coleção Sentinel-5P
+# ---------------------------
+collections = {
+    "NO2": "COPERNICUS/S5P/OFFL/L3_NO2",
+    "O3": "COPERNICUS/S5P/OFFL/L3_O3",
+    "CO": "COPERNICUS/S5P/OFFL/L3_CO"
+}
 
-    count = collection.size().getInfo()
-    st.sidebar.write(f"Imagens encontradas (S5P, NO2): {count}")
+band_map = {
+    "NO2": "NO2_column_number_density",
+    "O3": "O3_column_number_density",
+    "CO": "CO_column_number_density"
+}
 
-    if count == 0:
-        st.warning("Nenhuma imagem S5P encontrada para o intervalo/região selecionados.")
-    else:
-        mean_img = collection.mean().clip(roi)
-
-        vis = {
-            "min": 0.0,
-            "max": 0.00025,   # ajustar caso precise (mol/m^2)
-            "palette": ["black","blue","purple","cyan","green","yellow","red"]
-        }
-
-        # Adicionar camada EE ao folium
-        add_ee_layer(m, mean_img, vis, f"NO2 mean {sd} → {ed}")
-
-        # Legenda simples (Folium não adiciona automaticamente)
-        folium.map.LayerControl().add_to(m)
-
-else:
-    st.sidebar.error("Earth Engine NÃO inicializado.")
-    st.sidebar.info("Para usar o satélite via Earth Engine, instale e rode: `pip install earthengine-api` e depois `earthengine authenticate` no terminal.")
-
-# 2) Sobrepor pontos do CSV (upload ou exemplo)
-df = None
-if uploaded is not None:
-    df = pd.read_csv(uploaded)
-elif use_sample:
-    # tenta carregar um CSV de exemplo existente no diretório 'data/hortolandia_ar.csv'
-    try:
-        df = pd.read_csv("data/hortolandia_ar.csv")
-    except Exception:
-        # cria um sample pequeno caso não exista arquivo
-        df = pd.DataFrame({
-            "latitude": [-22.858, -22.860, -22.870],
-            "longitude": [-47.220, -47.230, -47.210],
-            "data": ["2025-09-01","2025-09-01","2025-09-02"],
-            "pm25":[35,28,15],
-            "no2":[20,18,10],
-            "o3":[40,35,25]
-        })
-
-# normalizar colunas
-if df is not None:
-    df.columns = [c.strip().lower() for c in df.columns]
-    if {"latitude","longitude","data"}.issubset(set(df.columns)):
-        # filtrar por intervalo de datas selecionado
-        df['data'] = pd.to_datetime(df['data'], errors='coerce')
-        mask = (df['data'] >= pd.to_datetime(start_date)) & (df['data'] <= pd.to_datetime(end_date))
-        df_f = df.loc[mask].copy()
-
-        # adicionar marcadores
-        for _, r in df_f.iterrows():
-            popup = folium.Popup(f"Data: {r['data'].date()}<br>PM2.5: {r.get('pm25','-')}<br>NO2: {r.get('no2','-')}<br>O3: {r.get('o3','-')}", max_width=260)
-            col = "red" if float(r.get("pm25", 0)) > 25 else ("orange" if float(r.get("pm25",0))>12 else "green")
-            folium.CircleMarker(location=[r['latitude'], r['longitude']], radius=6, color=col, fill=True, fill_opacity=0.7, popup=popup).add_to(m)
-
-        st.sidebar.write(f"Registros CSV no intervalo: {len(df_f)}")
-    else:
-        st.sidebar.error("CSV precisa ter colunas: latitude, longitude, data (e opcionalmente pm25, no2, o3).")
-
-# Renderizar mapa no Streamlit
-st.write("Mapa:")
-st_folium(m, height=650)
-
-# Mensagens de ajuda / troubleshooting
-with st.expander("🔧 Dicas de resolução (se você recebeu erro)"):
-    st.markdown("""
-    - **ModuleNotFoundError**: instale as libs:
-      ```
-      pip install streamlit folium streamlit-folium pandas earthengine-api
-      ```
-    - **Erro ao iniciar Earth Engine**: rode no terminal:
-      ```
-      earthengine authenticate
-      ```
-      e siga as instruções. Depois reinicie o app e `ee.Initialize()` funcionará localmente.
-    - **Deploy no Streamlit Cloud**: é necessário configurar autenticação por conta de serviço (JSON) e definir variável de ambiente `GOOGLE_APPLICATION_CREDENTIALS` — ou usar apenas o CSV fallback.
-    - **Se o erro persistir**: cole aqui a mensagem de erro completa e eu te ajudo a ajustar.
-    """)
+col = ee.ImageCollection(collections[pollutant]).select(band_map[p]()_
 
